@@ -5,6 +5,7 @@ import typing
 
 import torch
 import transformers
+from compressed_tensors.quantization.quant_args import QuantizationArgs, QuantizationType
 
 import pfgen
 
@@ -36,6 +37,14 @@ class Callback:
             self.model.eval()
             if device != "auto":
                 self.model.to(device)
+            if params.get("quant_args", None):
+                quant_args = QuantizationArgs(
+                    num_bits=params["quant_args"]["qbits"],
+                    type=QuantizationType(params["quant_args"]["qtype"]),
+                )
+                for layer in self.model.model.layers.layers:
+                    if not layer.is_mamba:
+                        layer.config.quant_args = quant_args
         assert self.tokenizer is not None
         tokenizer: transformers.PreTrainedTokenizer = self.tokenizer
         if not hasattr(tokenizer, "pad_token"):
@@ -142,6 +151,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for sampling.")
     parser.add_argument("--device", type=str, default="auto", help="Device for sampling.")
     parser.add_argument("--dtype", type=str, default="", help="Data type.")
+    parser.add_argument(
+        "--qbits",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--qtype",
+        type=str,
+        default="float",
+    )
     args = parser.parse_args()
     kwargs = {}
     if args.dtype:
@@ -152,6 +171,11 @@ if __name__ == "__main__":
             for t in chat_templates:
                 if args.model in t["models"]:
                     kwargs["chat_template"] = t["chat_template"]
+    if args.qbits:
+        kwargs["quant_args"] = {
+            "qbits": args.qbits,
+            "qtype": args.qtype,
+        }
     pfgen.run_tasks(
         args.mode,
         Callback(),
