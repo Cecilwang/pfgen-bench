@@ -1,11 +1,15 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import typing
+import uuid
 
 import torch
 import transformers
-from compressed_tensors.quantization.quant_args import QuantizationArgs, QuantizationType
+from compressed_tensors.quantization.quant_args import QuantizationArgs
+from compressed_tensors.quantization.quant_args import QuantizationType
+from compressed_tensors.quantization.quant_args import QuantizationStrategy
 
 import pfgen
 
@@ -14,7 +18,15 @@ class Callback:
     def __init__(self) -> None:
         self.tokenizer: transformers.PreTrainedTokenizer | None = None
         self.model: transformers.PreTrainedModel | None = None
+        self.counter = 0
+        self.uuid = str(uuid.uuid4())
 
+    def get_kv_cache_filename(self):
+        filename = Path(f"out/kv_cache/{self.uuid}/{self.counter}")
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        self.counter += 1
+        return filename
+ 
     def __call__(
         self, tasks: list[dict[str, str]], params: dict[str, typing.Any]
     ) -> typing.Iterator[str | None]:
@@ -38,13 +50,14 @@ class Callback:
             if device != "auto":
                 self.model.to(device)
             if params.get("quant_args", None):
-                quant_args = QuantizationArgs(
-                    num_bits=params["quant_args"]["qbits"],
-                    type=QuantizationType(params["quant_args"]["qtype"]),
+                self.model.config.init_quant_args(
+                    num_bits=args.qbits,
+                    type=args.qtype,
+                    group_size=args.qgroup,
+                    strategy=args.qstrategy,
+                    verbose=args.verbose,
+                    scale_and_zp_file=args.scale_and_zp,
                 )
-                for layer in self.model.model.layers.layers:
-                    if not layer.is_mamba:
-                        layer.config.quant_args = quant_args
         assert self.tokenizer is not None
         tokenizer: transformers.PreTrainedTokenizer = self.tokenizer
         if not hasattr(tokenizer, "pad_token"):
@@ -98,7 +111,7 @@ class Callback:
                     stop_strings.append(tokenizer.bos_token)
                 torch.manual_seed(task.get("seed", 0))
                 do_sample = params["temperature"] > 1e-6
-                outputs = model.generate(
+                output_with_cache = model.generate(
                     **{k: v.to(model.device) for k, v in inputs.items()},
                     max_new_tokens=params.get("max_tokens", 300),
                     do_sample=do_sample,
@@ -108,9 +121,17 @@ class Callback:
                     pad_token_id=tokenizer.eos_token_id,
                     tokenizer=tokenizer,
                     stop_strings=stop_strings,
+                    use_cache=True,
+                    return_dict_in_generate=True,
+                    output_attentions=False,  # Optional: Set to False to reduce output size if not needed
+                    output_hidden_states=False,  # Optional: Set to False to reduce output size if not needed
                 )
+                outputs = output_with_cache.sequences
+                if params.get("save_kv_cache", False):
+                    kv_cache = output_with_cache.past_key_values
+                    torch.save(kv_cache, self.get_kv_cache_filename())
             except Exception as e:
-                print(e)
+                raise e
                 for _ in task_group:
                     yield None
                 continue
@@ -160,6 +181,31 @@ if __name__ == "__main__":
         "--qtype",
         type=str,
         default="float",
+        choices=["float", "int"],
+    )
+    parser.add_argument(
+        "--qstrategy",
+        type=str,
+        default="static",
+        choices=["static", "token", "channel"],
+    )
+    parser.add_argument(
+        "--qgroup",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--scale_and_zp",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--save_kv_cache",
+        action="store_true",
     )
     args = parser.parse_args()
     kwargs = {}
@@ -173,9 +219,14 @@ if __name__ == "__main__":
                     kwargs["chat_template"] = t["chat_template"]
     if args.qbits:
         kwargs["quant_args"] = {
-            "qbits": args.qbits,
-            "qtype": args.qtype,
+            "num_bits": args.qbits,
+            "type": args.qtype,
+            "strategy": args.qstrategy,
+            "group_size": args.qgroup,
+            "scale_and_zp_file": args.scale_and_zp,
+            "verbose": args.verbose,
         }
+    kwargs["save_kv_cache"] = args.save_kv_cache
     pfgen.run_tasks(
         args.mode,
         Callback(),
